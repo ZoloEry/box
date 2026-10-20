@@ -92,8 +92,17 @@ fi
 if [ -f "$file_settings" ] && [ -r "$file_settings" ] && [ -s "$file_settings" ]; then
   wait_for_data_ready
   refresh_box
-  start_service
-  enable_iptables
+  # 启用网络服务控制时，先让监听做一次策略判断，再决定是否启动核心。
+  # 否则连接黑名单 Wi-Fi 重启后会先启动核心、再被策略停止（issue #42）。
+  if [ "${enable_network_service_control}" = "true" ] && [ -f "${scripts_dir}/ctr.utils" ]; then
+    start_inotifyd
+    busybox sleep 2
+    "${scripts_dir}/net.inotify" w
+  else
+    start_service
+    enable_iptables
+    start_inotifyd
+  fi
+else
+  start_inotifyd
 fi
-
-start_inotifyd

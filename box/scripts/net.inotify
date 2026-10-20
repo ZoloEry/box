@@ -29,6 +29,7 @@ NET_LOG_FILE="${LOG_DIR}/net.log"
 CTRL_LOG_FILE="${LOG_DIR}/netswitch.log"
 CTRL_STATE_FILE="${STATE_DIR}/last_check_time"
 CTRL_WIFI_STATE_FILE="${STATE_DIR}/last_wifi_state"
+CTRL_BOOT_FILE="${STATE_DIR}/last_wifi_boot"
 CTRL_STABILITY_WINDOW=3
 
 # ex: 7.1.1
@@ -276,8 +277,17 @@ stop_service_if_needed() {
   control_log_msg "[停止] 服务已停止"
 }
 
+current_boot_id() {
+  if [ -r /proc/sys/kernel/random/boot_id ]; then
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null
+    return 0
+  fi
+  busybox stat -c '%Y' /proc/1 2>/dev/null
+}
+
 save_wifi_state() {
   printf '%s\n' "$1" > "${CTRL_WIFI_STATE_FILE}"
+  current_boot_id > "${CTRL_BOOT_FILE}" 2>/dev/null
 }
 
 apply_network_control_policy() {
@@ -326,8 +336,14 @@ apply_network_control_policy() {
 
   local state_key="${wifi_status}|${ssid}|${bssid}|${wifi_ip}"
   local prev_key=""
-  [ -f "${CTRL_WIFI_STATE_FILE}" ] && prev_key=$(cat "${CTRL_WIFI_STATE_FILE}" 2>/dev/null)
-  if [ "${state_key}" = "${prev_key}" ]; then
+  local prev_boot=""
+  if [ -f "${CTRL_WIFI_STATE_FILE}" ]; then
+    prev_key=$(cat "${CTRL_WIFI_STATE_FILE}" 2>/dev/null)
+    prev_boot=$(cat "${CTRL_BOOT_FILE}" 2>/dev/null)
+  fi
+  # 状态缓存只在同一次开机周期内有效。否则重启后仍在同一 Wi-Fi 下时会被误判为
+  # “网络状态未变化”，使 SSID 黑名单等策略在开机首次检查中被跳过（issue #42）。
+  if [ "${state_key}" = "${prev_key}" ] && [ -n "${prev_boot}" ] && [ "${prev_boot}" = "$(current_boot_id)" ]; then
     control_log_msg "网络状态未变化，跳过策略"
     return 0
   fi
