@@ -3128,12 +3128,19 @@ if [ "${network_mode}" = "ebpf" ] && [[ "${bin_name}" == @(mihomo|sing-box) ]]; 
     disable)
       cleanup_mode="all"
       [ "${runtime_loaded}" = "true" ] && cleanup_mode="${network_mode:-all}"
+      if [ "${runtime_loaded}" = "true" ]; then
+        log Info "按启动时快照清理: 内核=${bin_name}, 网络模式=${network_mode}"
+      else
+        log Warn "未找到运行时快照，按全量模式清理"
+      fi
       if [ "${cleanup_mode}" != "ebpf" ]; then
+        log Warning "正在清理 ${cleanup_mode} 模式的残留规则。"
         cleanup_iptables_for_mode "${cleanup_mode}"
         cleanup_rule_ebpf
+      else
+        log Info "启动时即为 eBPF 模式，无 iptables 规则需要清理。"
       fi
       runtime_clear
-      log Info "eBPF 模式不创建网络规则，运行状态已清理"
       ;;
     *)
       echo "${red}$0 $1 未知命令${normal}"

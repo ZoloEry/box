@@ -11,8 +11,11 @@ run_as_su() {
 
 stop_service() {
     echo "服务正在关闭..."
-    run_as_su "${box_dir}/scripts/box.iptables disable"
+    # 先停核心：TUN 设备、mihomo 自身的路由表与 ip rule 随进程退出一起消失，
+    # 避免清理时核心仍在运行、规则被重新写入，造成“清了又出现”的错觉。
     run_as_su "${box_dir}/scripts/box.service stop"
+    # 再清 box 自己下发的规则（旁路链、路由表、CNIP 等）
+    run_as_su "${box_dir}/scripts/box.iptables disable"
 }
 
 start_service() {
