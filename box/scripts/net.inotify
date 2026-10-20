@@ -344,6 +344,164 @@ apply_network_control_policy() {
   control_log_msg "完成"
 }
 
+# ==========================================================
+# TUN 出网看门狗（eta 2026-10-20 添加）
+# ----------------------------------------------------------
+# 触发：/data/misc/net 变化（网络重建）后由 inotifyd 调用本脚本。
+# 背景：mihomo 默认接口 monitor 在网络重建后偶发不再重新探测，
+#       报 "[TUN] default interface lost by monitor"，TUN 出口为空，
+#       表现为全设备断网，需切飞行模式或重启核心才能恢复。
+# 策略：等网络稳定 -> 探测出网 -> 失败则 reload -> 仍失败则 restart。
+# 限流：30 秒冷却；5 分钟内最多自动重启 3 次（避免无信号时循环重启）。
+# 关闭方式：把下面 enabled 改为 false，或整段删除。
+# ==========================================================
+HEALTH_STATE_FILE="${STATE_DIR}/health_watch.last"
+HEALTH_RESTART_FILE="${STATE_DIR}/health_restart.history"
+HEALTH_LOCK_DIR="${STATE_DIR}/health.lock"
+HEALTH_DELAY=8
+HEALTH_COOLDOWN=30
+HEALTH_RESTART_WINDOW=300
+HEALTH_RESTART_LIMIT=3
+
+health_log() {
+  local level="$1"
+  shift
+  ensure_dirs
+  printf '%s [%s]: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${level}" "$*" >> "${NET_LOG_FILE}" 2>/dev/null || true
+}
+
+health_underlay_ready() {
+  ip route show table all 2>/dev/null \
+    | grep -E '^default ' \
+    | grep -vE 'dev (mihoyo|dummy0)' \
+    | grep -q .
+}
+
+health_probe() {
+  if curl -s -m 6 -o /dev/null -w '%{http_code}' 'http://connect.rom.miui.com/generate_204' 2>/dev/null | grep -q '^204$'; then
+    return 0
+  fi
+  curl -s -m 8 -o /dev/null 'https://www.baidu.com' 2>/dev/null && return 0
+  return 1
+}
+
+health_cooldown_ok() {
+  local now last
+  now=$(date +%s)
+  last=0
+  [ -f "${HEALTH_STATE_FILE}" ] && last=$(cat "${HEALTH_STATE_FILE}" 2>/dev/null)
+  case "${last}" in
+    ''|*[!0-9]*) last=0 ;;
+  esac
+  [ $((now - last)) -ge ${HEALTH_COOLDOWN} ]
+}
+
+health_restart_allowed() {
+  local now ts recent count
+  now=$(date +%s)
+  recent=""
+  if [ -f "${HEALTH_RESTART_FILE}" ]; then
+    for ts in $(cat "${HEALTH_RESTART_FILE}" 2>/dev/null); do
+      case "${ts}" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      [ $((now - ts)) -lt ${HEALTH_RESTART_WINDOW} ] && recent="${recent}${ts} "
+    done
+  fi
+  printf '%s\n' "${recent}" > "${HEALTH_RESTART_FILE}" 2>/dev/null || true
+  count=$(printf '%s' "${recent}" | wc -w)
+  [ "${count}" -lt "${HEALTH_RESTART_LIMIT}" ]
+}
+
+health_record_restart() {
+  local recent
+  recent=""
+  [ -f "${HEALTH_RESTART_FILE}" ] && recent=$(cat "${HEALTH_RESTART_FILE}" 2>/dev/null)
+  printf '%s%s\n' "${recent}" "$(date +%s) " > "${HEALTH_RESTART_FILE}" 2>/dev/null || true
+}
+
+health_reload_mihomo() {
+  local ctrl port secret
+  [ -f "${mihomo_config}" ] || return 1
+  ctrl=$(sed -n 's/^external-controller:[[:space:]]*//p' "${mihomo_config}" 2>/dev/null | head -n 1 | sed 's/[[:space:]]*#.*//' | tr -d "\"' \r")
+  secret=$(sed -n 's/^secret:[[:space:]]*//p' "${mihomo_config}" 2>/dev/null | head -n 1 | sed 's/[[:space:]]*#.*//' | tr -d "\"' \r")
+  port="9090"
+  [ -n "${ctrl}" ] && port="${ctrl##*:}"
+  case "${port}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ -n "${secret}" ]; then
+    curl -s -m 10 -o /dev/null -X PUT \
+      -H "Authorization: Bearer ${secret}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"path\":\"${mihomo_config}\"}" \
+      "http://127.0.0.1:${port}/configs?force=true" 2>/dev/null
+  else
+    curl -s -m 10 -o /dev/null -X PUT \
+      -H 'Content-Type: application/json' \
+      -d "{\"path\":\"${mihomo_config}\"}" \
+      "http://127.0.0.1:${port}/configs?force=true" 2>/dev/null
+  fi
+}
+
+watch_tun_health() {
+  local enabled="true"
+
+  [ "${enabled}" = "true" ] || return 0
+  [ "${network_mode}" = "tun" ] || return 0
+  [ "${bin_name}" = "mihomo" ] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  is_service_running || return 0
+
+  ensure_dirs
+  mkdir "${HEALTH_LOCK_DIR}" 2>/dev/null || return 0
+  trap 'rmdir "${HEALTH_LOCK_DIR}" 2>/dev/null' EXIT
+
+  health_cooldown_ok || return 0
+  date +%s > "${HEALTH_STATE_FILE}" 2>/dev/null || true
+
+  busybox sleep ${HEALTH_DELAY}
+  is_service_running || return 0
+
+  if ! health_underlay_ready; then
+    health_log "Info" "看门狗: 底层暂无默认路由（疑似信号中断），跳过本次检查"
+    return 0
+  fi
+
+  if health_probe; then
+    health_log "Info" "看门狗: 网络变化后出网正常"
+    return 0
+  fi
+
+  health_log "Warn" "看门狗: 出网探测失败，尝试重载 mihomo 配置"
+  health_reload_mihomo >/dev/null 2>&1
+  busybox sleep 5
+  if health_probe; then
+    health_log "Info" "看门狗: 重载后恢复正常"
+    return 0
+  fi
+
+  if ! health_restart_allowed; then
+    health_log "Warn" "看门狗: 5 分钟内已自动重启 ${HEALTH_RESTART_LIMIT} 次，暂停重启以免无信号时循环"
+    return 0
+  fi
+
+  health_log "Warn" "看门狗: 重载无效，重启核心服务"
+  # setsid: 让核心脱离调用者的进程组，避免被上层会话清理一并杀掉
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+  else
+    "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+  fi
+  health_record_restart
+  busybox sleep 10
+  if health_probe; then
+    health_log "Info" "看门狗: 重启后恢复正常"
+  else
+    health_log "Warn" "看门狗: 重启后仍失败，可能是节点不可用或底层网络问题"
+  fi
+}
+
 if [ "${events}" = "w" ]; then
   reset_event_logs
   if [ ! -f "${BASE_DIR}/settings.ini" ]; then
@@ -358,4 +516,5 @@ if [ "${events}" = "w" ]; then
     net_log_info "未检测到运行中的核心进程，跳过防回环规则更新"
   fi
   apply_network_control_policy
+  ( watch_tun_health ) &
 fi
