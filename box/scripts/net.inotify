@@ -396,6 +396,16 @@ HEALTH_RECHECK_ROUNDS=5
 # 组名不存在（404）时视为无法判断，不做任何动作，避免误重启。
 HEALTH_PROBE_GROUP="Hong Kong"
 HEALTH_PROBE_TIMEOUT=25
+# 底层未就绪时的等待窗口：每 15 秒探测一次，最多 12 次（3 分钟）。
+# 只用于覆盖“网络恢复后底层还在初始化”的抖动，不是等信号回来——
+# 长时间无信号期间不做任何动作，恢复时的网络事件会重新触发本脚本。
+HEALTH_UNDERLAY_RETRIES=12
+HEALTH_UNDERLAY_INTERVAL=15
+# 等待超时后再挂延时兜底：5 分钟后自动补查，最多 2 轮，
+# 避免“恢复事件来得太早、之后又没有新事件”导致彻底错过。
+HEALTH_DEFER_ROUNDS=2
+HEALTH_DEFER_DELAY=300
+HEALTH_DEFER_FILE="${STATE_DIR}/health_defer.state"
 
 health_log() {
   local level="$1"
@@ -570,9 +580,103 @@ health_reload_mihomo() {
   fi
 }
 
+# 等待底层就绪：每 HEALTH_UNDERLAY_INTERVAL 秒探测一次。
+# 就绪则输出网卡名并返回 0；服务被停掉或超时返回 1。
+health_await_underlay() {
+  local attempt=0 iface
+  while [ "${attempt}" -lt ${HEALTH_UNDERLAY_RETRIES} ]; do
+    if ! is_service_running; then
+      return 1
+    fi
+    iface=$(health_underlay_iface)
+    if [ -n "${iface}" ] && health_underlay_probe "${iface}"; then
+      printf '%s\n' "${iface}"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    [ "${attempt}" -lt ${HEALTH_UNDERLAY_RETRIES} ] || break
+    busybox sleep ${HEALTH_UNDERLAY_INTERVAL}
+  done
+  return 1
+}
+
+# 延时兜底：等待超时后再自动补查一次（最多 HEALTH_DEFER_ROUNDS 轮）
+health_schedule_deferred_check() {
+  local rounds=0
+  [ -f "${HEALTH_DEFER_FILE}" ] && rounds=$(cat "${HEALTH_DEFER_FILE}" 2>/dev/null)
+  case "${rounds}" in
+    ''|*[!0-9]*) rounds=0 ;;
+  esac
+  if [ "${rounds}" -ge ${HEALTH_DEFER_ROUNDS} ]; then
+    health_log "Info" "看门狗: 延时兜底已用完（${HEALTH_DEFER_ROUNDS} 轮），等下次网络事件"
+    return 0
+  fi
+  rounds=$((rounds + 1))
+  printf '%s\n' "${rounds}" > "${HEALTH_DEFER_FILE}" 2>/dev/null || true
+  health_log "Info" "看门狗: ${HEALTH_DEFER_DELAY}s 后再补一次检查（${rounds}/${HEALTH_DEFER_ROUNDS}）"
+  (
+    busybox sleep ${HEALTH_DEFER_DELAY}
+    "${SCRIPTS_DIR}/net.inotify" w
+  ) >/dev/null 2>&1 &
+}
+
+health_clear_defer() {
+  rm -f "${HEALTH_DEFER_FILE}" 2>/dev/null || true
+}
+
+# 直连正常时，进一步确认机场节点可用（节点全黑时直连照样通）
+health_check_provider_path() {
+  local pstate old_pid
+  pstate=$(health_provider_probe)
+  case "${pstate}" in
+    ok)
+      health_log "Info" "看门狗: 出网正常（机场节点可用）"
+      health_clear_defer
+      return 0
+      ;;
+    fail)
+      health_log "Warn" "看门狗: 直连正常但机场节点全部不可用，尝试重载 mihomo 配置"
+      health_reload_mihomo >/dev/null 2>&1
+      busybox sleep 8
+      if [ "$(health_provider_probe)" = "ok" ]; then
+        health_log "Info" "看门狗: 重载后节点恢复"
+        health_clear_defer
+        return 0
+      fi
+      if ! health_restart_allowed; then
+        health_log "Warn" "看门狗: 10 分钟内已有效重启 ${HEALTH_RESTART_LIMIT} 次，跳过本次重启"
+        return 0
+      fi
+      health_log "Warn" "看门狗: 重载无效，重启核心以刷新接口绑定"
+      old_pid=$(health_current_pid)
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+      else
+        "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+      fi
+      if health_wait_restart_done "${old_pid}"; then
+        if [ "$(health_provider_probe)" = "ok" ]; then
+          health_log "Info" "看门狗: 重启后节点恢复"
+          health_clear_defer
+        else
+          health_record_restart
+          health_log "Warn" "看门狗: 重启后节点仍不可用，已计入有效失败"
+        fi
+      else
+        health_log "Warn" "看门狗: 重启未在 ${HEALTH_RESTART_WAIT}s 内就绪，不计入额度"
+      fi
+      return 0
+      ;;
+    *)
+      health_log "Info" "看门狗: 无法判断机场节点状态（组 ${HEALTH_PROBE_GROUP}），跳过"
+      return 0
+      ;;
+  esac
+}
+
 watch_tun_health() {
   local enabled="true"
-  local iface underlay_ok proxy_ok old_pid round waited
+  local iface round waited old_pid
 
   [ "${enabled}" = "true" ] || return 0
   [ "${network_mode}" = "tun" ] || return 0
@@ -590,58 +694,26 @@ watch_tun_health() {
   busybox sleep ${HEALTH_DELAY}
   is_service_running || return 0
 
-  iface=$(health_underlay_iface)
-  if [ -z "${iface}" ]; then
-    health_log "Info" "看门狗: 底层没有默认出口网卡（疑似信号中断），跳过本次检查"
+  # 第一跳：直连探测。通就说明底层没问题，直接进入机场节点探测。
+  if health_proxy_probe; then
+    health_check_provider_path
     return 0
   fi
 
-  # 直连探测：目标域名走国内直连规则，只能证明整机还能上网，
-  # 不能证明代理节点可用——节点全黑时直连照样通，所以还要单独测机场节点。
+  # 直连不通：可能真没信号，也可能刚恢复、底层还在初始化。
+  # 在 3 分钟窗口内反复确认，一旦底层就绪就继续往下判断。
+  iface=$(health_await_underlay)
+  if [ -z "${iface}" ]; then
+    health_log "Info" "看门狗: 等待 $((HEALTH_UNDERLAY_RETRIES * HEALTH_UNDERLAY_INTERVAL))s 后底层仍未就绪（疑似无信号），本次不动作"
+    health_schedule_deferred_check
+    return 0
+  fi
+
+  health_log "Info" "看门狗: 底层已就绪（${iface}），复查代理路径"
+
   if health_proxy_probe; then
-    local pstate
-    pstate=$(health_provider_probe)
-    case "${pstate}" in
-      ok)
-        health_log "Info" "看门狗: 网络变化后出网正常（底层 ${iface}，机场节点可用）"
-        return 0
-        ;;
-      fail)
-        health_log "Warn" "看门狗: 直连正常但机场节点全部不可用，尝试重载 mihomo 配置"
-        health_reload_mihomo >/dev/null 2>&1
-        busybox sleep 8
-        if [ "$(health_provider_probe)" = "ok" ]; then
-          health_log "Info" "看门狗: 重载后节点恢复"
-          return 0
-        fi
-        if ! health_restart_allowed; then
-          health_log "Warn" "看门狗: 10 分钟内已有效重启 ${HEALTH_RESTART_LIMIT} 次，跳过本次重启"
-          return 0
-        fi
-        health_log "Warn" "看门狗: 重载无效，重启核心以刷新接口绑定"
-        old_pid=$(health_current_pid)
-        if command -v setsid >/dev/null 2>&1; then
-          setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
-        else
-          "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
-        fi
-        if health_wait_restart_done "${old_pid}"; then
-          if [ "$(health_provider_probe)" = "ok" ]; then
-            health_log "Info" "看门狗: 重启后节点恢复"
-          else
-            health_record_restart
-            health_log "Warn" "看门狗: 重启后节点仍不可用，已计入有效失败"
-          fi
-        else
-          health_log "Warn" "看门狗: 重启未在 ${HEALTH_RESTART_WAIT}s 内就绪，不计入额度"
-        fi
-        return 0
-        ;;
-      *)
-        health_log "Info" "看门狗: 无法判断机场节点状态（组 ${HEALTH_PROBE_GROUP}），跳过"
-        return 0
-        ;;
-    esac
+    health_check_provider_path
+    return 0
   fi
 
   if ! health_tun_present; then
@@ -649,19 +721,12 @@ watch_tun_health() {
     return 0
   fi
 
-  # 代理不通，接下来必须确认底层真的能出去，否则一律不动手
-  health_underlay_probe "${iface}"
-  underlay_ok=$?
-  if [ "${underlay_ok}" -ne 0 ]; then
-    health_log "Info" "看门狗: 代理不通但底层 ${iface} 也不通（信号未恢复），只记录不动作"
-    return 0
-  fi
-
   health_log "Warn" "看门狗: 底层 ${iface} 正常但代理不通，尝试重载 mihomo 配置"
   health_reload_mihomo >/dev/null 2>&1
-  busybox sleep 5
+  busybox sleep 8
   if health_proxy_probe; then
     health_log "Info" "看门狗: 重载后恢复正常"
+    health_clear_defer
     return 0
   fi
 
@@ -679,6 +744,7 @@ watch_tun_health() {
       fi
       if health_proxy_probe; then
         health_log "Info" "看门狗: 轮询 ${waited}s 后出网自行恢复"
+        health_clear_defer
         return 0
       fi
     done
@@ -700,9 +766,9 @@ watch_tun_health() {
     return 0
   fi
 
-  # 重启流程确实走完了，此刻再判成败；只有仍然不通才算一次有效失败
   if health_proxy_probe; then
     health_log "Info" "看门狗: 重启后恢复正常"
+    health_clear_defer
     return 0
   fi
 
