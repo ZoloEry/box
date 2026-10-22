@@ -361,14 +361,24 @@ apply_network_control_policy() {
 }
 
 # ==========================================================
-# TUN 出网看门狗（eta 2026-10-20 添加）
+# TUN 出网看门狗（eta 2026-10-20 添加，2026-10-22 重做判定逻辑）
 # ----------------------------------------------------------
 # 触发：/data/misc/net 变化（网络重建）后由 inotifyd 调用本脚本。
 # 背景：mihomo 默认接口 monitor 在网络重建后偶发不再重新探测，
 #       报 "[TUN] default interface lost by monitor"，TUN 出口为空，
 #       表现为全设备断网，需切飞行模式或重启核心才能恢复。
-# 策略：等网络稳定 -> 探测出网 -> 失败则 reload -> 仍失败则 restart。
-# 限流：30 秒冷却；5 分钟内最多自动重启 3 次（避免无信号时循环重启）。
+#
+# 分层判定（关键）：
+#   1) 底层链路层：绑当前数据网卡探测，确认运营商侧真的能出去
+#   2) TUN 层：TUN 设备存在、路由可用
+#   3) 代理层：走 TUN 探测真实出网
+#   只有“底层通 + 代理不通”才动手；底层不通只记录，不消耗任何额度。
+#
+# 动作与额度：
+#   - reload 不计数，可反复尝试（轻量、无副作用）
+#   - restart 必须等流程真正完成（新 PID + TUN 就绪）再判定，且仅在
+#     “底层确认通、reload 后依然不通”时才算一次有效失败并计入额度
+#   - 额度用尽后退化为低频轮询，网络自己恢复也会被记录
 # 关闭方式：把下面 enabled 改为 false，或整段删除。
 # ==========================================================
 HEALTH_STATE_FILE="${STATE_DIR}/health_watch.last"
@@ -376,8 +386,11 @@ HEALTH_RESTART_FILE="${STATE_DIR}/health_restart.history"
 HEALTH_LOCK_DIR="${STATE_DIR}/health.lock"
 HEALTH_DELAY=8
 HEALTH_COOLDOWN=30
-HEALTH_RESTART_WINDOW=300
-HEALTH_RESTART_LIMIT=3
+HEALTH_RESTART_WINDOW=600
+HEALTH_RESTART_LIMIT=2
+HEALTH_RESTART_WAIT=45
+HEALTH_RECHECK_INTERVAL=120
+HEALTH_RECHECK_ROUNDS=5
 
 health_log() {
   local level="$1"
@@ -386,18 +399,40 @@ health_log() {
   printf '%s [%s]: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${level}" "$*" >> "${NET_LOG_FILE}" 2>/dev/null || true
 }
 
-health_underlay_ready() {
-  ip route show table all 2>/dev/null \
-    | grep -E '^default ' \
-    | grep -vE 'dev (mihoyo|dummy0)' \
-    | grep -q .
+# 找一个可用的底层出口网卡：
+# 1) 优先向系统要“当前默认网络”的接口（多卡机器上最准）
+# 2) 拿不到再回退到路由表推导（排除 TUN、dummy 等）
+health_underlay_iface() {
+  local iface netid
+  netid=$(dumpsys connectivity 2>/dev/null | sed -n 's/^Active default network: \([0-9][0-9]*\).*/\1/p' | head -n 1)
+  if [ -n "${netid}" ]; then
+    iface=$(dumpsys connectivity 2>/dev/null | grep -m1 "network{${netid}}" | sed -n 's/.*InterfaceName: \([A-Za-z0-9_.-]*\).*/\1/p')
+  fi
+  if [ -z "${iface}" ]; then
+    iface=$(ip route show table all 2>/dev/null \
+      | grep -E '^default ' \
+      | grep -vE 'dev (mihoyo|dummy0|lo|ifb[0-9])' \
+      | sed -n 's/.*dev \([^ ]*\).*/\1/p' \
+      | head -n 1)
+  fi
+  [ -n "${iface}" ] && printf '%s\n' "${iface}"
 }
 
-health_probe() {
-  if curl -s -m 6 -o /dev/null -w '%{http_code}' 'http://connect.rom.miui.com/generate_204' 2>/dev/null | grep -q '^204$'; then
-    return 0
-  fi
-  curl -s -m 8 -o /dev/null 'https://www.baidu.com' 2>/dev/null && return 0
+health_tun_present() {
+  ip link show "${tun_device:-mihoyo}" >/dev/null 2>&1
+}
+
+# 代理层探测：走 TUN 默认路由，必须 fail 快、且不依赖 DNS 之外的中间件
+health_proxy_probe() {
+  curl -s -m 6 -o /dev/null -w '%{http_code}' 'http://connect.rom.miui.com/generate_204' 2>/dev/null | grep -q '^204$'
+}
+
+# 底层探测：显式绑定物理网卡，绕过 TUN
+health_underlay_probe() {
+  local iface="$1"
+  [ -n "${iface}" ] || return 1
+  curl -s -m 8 --interface "${iface}" -o /dev/null 'http://connect.rom.miui.com/generate_204' 2>/dev/null && return 0
+  curl -s -m 8 --interface "${iface}" -o /dev/null 'http://www.baidu.com' 2>/dev/null && return 0
   return 1
 }
 
@@ -436,6 +471,27 @@ health_record_restart() {
   printf '%s%s\n' "${recent}" "$(date +%s) " > "${HEALTH_RESTART_FILE}" 2>/dev/null || true
 }
 
+health_current_pid() {
+  cat "${BOX_PID_FILE}" 2>/dev/null
+}
+
+# 重启后等待流程真正完成：新 PID 出现 + TUN 设备就绪
+health_wait_restart_done() {
+  local old_pid="$1"
+  local waited=0
+  local now_pid
+
+  while [ "${waited}" -lt ${HEALTH_RESTART_WAIT} ]; do
+    now_pid=$(health_current_pid)
+    if [ -n "${now_pid}" ] && [ "${now_pid}" != "${old_pid}" ] && kill -0 "${now_pid}" 2>/dev/null && health_tun_present; then
+      return 0
+    fi
+    busybox sleep 2
+    waited=$((waited + 2))
+  done
+  return 1
+}
+
 health_reload_mihomo() {
   local ctrl port secret
   [ -f "${mihomo_config}" ] || return 1
@@ -462,6 +518,7 @@ health_reload_mihomo() {
 
 watch_tun_health() {
   local enabled="true"
+  local iface underlay_ok proxy_ok old_pid round waited
 
   [ "${enabled}" = "true" ] || return 0
   [ "${network_mode}" = "tun" ] || return 0
@@ -479,43 +536,82 @@ watch_tun_health() {
   busybox sleep ${HEALTH_DELAY}
   is_service_running || return 0
 
-  if ! health_underlay_ready; then
-    health_log "Info" "看门狗: 底层暂无默认路由（疑似信号中断），跳过本次检查"
+  iface=$(health_underlay_iface)
+  if [ -z "${iface}" ]; then
+    health_log "Info" "看门狗: 底层没有默认出口网卡（疑似信号中断），跳过本次检查"
     return 0
   fi
 
-  if health_probe; then
-    health_log "Info" "看门狗: 网络变化后出网正常"
+  # 先看代理层；通就直接收工，不动底层探测
+  if health_proxy_probe; then
+    health_log "Info" "看门狗: 网络变化后出网正常（底层 ${iface}）"
     return 0
   fi
 
-  health_log "Warn" "看门狗: 出网探测失败，尝试重载 mihomo 配置"
+  if ! health_tun_present; then
+    health_log "Warn" "看门狗: TUN 设备 ${tun_device:-mihoyo} 不存在，跳过（由服务状态决定是否重启）"
+    return 0
+  fi
+
+  # 代理不通，接下来必须确认底层真的能出去，否则一律不动手
+  health_underlay_probe "${iface}"
+  underlay_ok=$?
+  if [ "${underlay_ok}" -ne 0 ]; then
+    health_log "Info" "看门狗: 代理不通但底层 ${iface} 也不通（信号未恢复），只记录不动作"
+    return 0
+  fi
+
+  health_log "Warn" "看门狗: 底层 ${iface} 正常但代理不通，尝试重载 mihomo 配置"
   health_reload_mihomo >/dev/null 2>&1
   busybox sleep 5
-  if health_probe; then
+  if health_proxy_probe; then
     health_log "Info" "看门狗: 重载后恢复正常"
     return 0
   fi
 
   if ! health_restart_allowed; then
-    health_log "Warn" "看门狗: 5 分钟内已自动重启 ${HEALTH_RESTART_LIMIT} 次，暂停重启以免无信号时循环"
+    health_log "Warn" "看门狗: 10 分钟内已有效重启 ${HEALTH_RESTART_LIMIT} 次，退化为低频轮询"
+    round=0
+    waited=0
+    while [ "${round}" -lt ${HEALTH_RECHECK_ROUNDS} ]; do
+      busybox sleep ${HEALTH_RECHECK_INTERVAL}
+      round=$((round + 1))
+      waited=$((waited + HEALTH_RECHECK_INTERVAL))
+      if ! is_service_running; then
+        health_log "Info" "看门狗: 轮询中检测到服务已停止，退出"
+        return 0
+      fi
+      if health_proxy_probe; then
+        health_log "Info" "看门狗: 轮询 ${waited}s 后出网自行恢复"
+        return 0
+      fi
+    done
+    health_log "Warn" "看门狗: 轮询结束仍未恢复，等待下次网络事件"
     return 0
   fi
 
   health_log "Warn" "看门狗: 重载无效，重启核心服务"
+  old_pid=$(health_current_pid)
   # setsid: 让核心脱离调用者的进程组，避免被上层会话清理一并杀掉
   if command -v setsid >/dev/null 2>&1; then
     setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
   else
     "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
   fi
-  health_record_restart
-  busybox sleep 10
-  if health_probe; then
-    health_log "Info" "看门狗: 重启后恢复正常"
-  else
-    health_log "Warn" "看门狗: 重启后仍失败，可能是节点不可用或底层网络问题"
+
+  if ! health_wait_restart_done "${old_pid}"; then
+    health_log "Warn" "看门狗: 重启未在 ${HEALTH_RESTART_WAIT}s 内就绪，不计入额度"
+    return 0
   fi
+
+  # 重启流程确实走完了，此刻再判成败；只有仍然不通才算一次有效失败
+  if health_proxy_probe; then
+    health_log "Info" "看门狗: 重启后恢复正常"
+    return 0
+  fi
+
+  health_record_restart
+  health_log "Warn" "看门狗: 重启后底层通但代理仍不通，已计入有效失败（可能是节点或配置问题）"
 }
 
 if [ "${events}" = "w" ]; then
