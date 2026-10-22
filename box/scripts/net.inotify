@@ -391,6 +391,11 @@ HEALTH_RESTART_LIMIT=2
 HEALTH_RESTART_WAIT=45
 HEALTH_RECHECK_INTERVAL=120
 HEALTH_RECHECK_ROUNDS=5
+# 机场节点健康探测：对哪个地区组做延迟测试。直连探测只能证明能上网，
+# 节点全黑时直连照样通，所以必须单独测一组真实节点。
+# 组名不存在（404）时视为无法判断，不做任何动作，避免误重启。
+HEALTH_PROBE_GROUP="Hong Kong"
+HEALTH_PROBE_TIMEOUT=25
 
 health_log() {
   local level="$1"
@@ -492,6 +497,55 @@ health_wait_restart_done() {
   return 1
 }
 
+# 读取控制端口与密钥（API 探测与 reload 共用），输出两行：端口、密钥
+health_api_auth() {
+  local ctrl port secret
+  [ -f "${mihomo_config}" ] || return 1
+  ctrl=$(sed -n 's/^external-controller:[[:space:]]*//p' "${mihomo_config}" 2>/dev/null | head -n 1 | sed 's/[[:space:]]*#.*//' | tr -d "\"' \r")
+  secret=$(sed -n 's/^secret:[[:space:]]*//p' "${mihomo_config}" 2>/dev/null | head -n 1 | sed 's/[[:space:]]*#.*//' | tr -d "\"' \r")
+  port="9090"
+  [ -n "${ctrl}" ] && port="${ctrl##*:}"
+  case "${port}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n%s\n' "${port}" "${secret}"
+}
+
+# 机场节点健康探测：对地区组做一次真实延迟测试。
+# 返回 ok / fail / unknown（组不存在或 API 不可用时为 unknown，调用方不做动作）
+health_provider_probe() {
+  local auth port secret resp code url group
+  group="${HEALTH_PROBE_GROUP:-Hong Kong}"
+  auth=$(health_api_auth) || { printf 'unknown\n'; return 2; }
+  port=$(printf '%s\n' "${auth}" | sed -n '1p')
+  secret=$(printf '%s\n' "${auth}" | sed -n '2p')
+  url="http://127.0.0.1:${port}/group/$(printf '%s' "${group}" | sed 's/ /%20/g')/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=4000"
+  if [ -n "${secret}" ]; then
+    resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' -H "Authorization: Bearer ${secret}" "${url}" 2>/dev/null)
+  else
+    resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' "${url}" 2>/dev/null)
+  fi
+  code=$(printf '%s\n' "${resp}" | tail -n 1)
+  case "${code}" in
+    200)
+      if printf '%s\n' "${resp}" | grep -qE '"[^"]+":[0-9]+'; then
+        printf 'ok\n'
+        return 0
+      fi
+      printf 'fail\n'
+      return 1
+      ;;
+    404)
+      printf 'unknown\n'
+      return 2
+      ;;
+    *)
+      printf 'unknown\n'
+      return 2
+      ;;
+  esac
+}
+
 health_reload_mihomo() {
   local ctrl port secret
   [ -f "${mihomo_config}" ] || return 1
@@ -542,10 +596,52 @@ watch_tun_health() {
     return 0
   fi
 
-  # 先看代理层；通就直接收工，不动底层探测
+  # 直连探测：目标域名走国内直连规则，只能证明整机还能上网，
+  # 不能证明代理节点可用——节点全黑时直连照样通，所以还要单独测机场节点。
   if health_proxy_probe; then
-    health_log "Info" "看门狗: 网络变化后出网正常（底层 ${iface}）"
-    return 0
+    local pstate
+    pstate=$(health_provider_probe)
+    case "${pstate}" in
+      ok)
+        health_log "Info" "看门狗: 网络变化后出网正常（底层 ${iface}，机场节点可用）"
+        return 0
+        ;;
+      fail)
+        health_log "Warn" "看门狗: 直连正常但机场节点全部不可用，尝试重载 mihomo 配置"
+        health_reload_mihomo >/dev/null 2>&1
+        busybox sleep 8
+        if [ "$(health_provider_probe)" = "ok" ]; then
+          health_log "Info" "看门狗: 重载后节点恢复"
+          return 0
+        fi
+        if ! health_restart_allowed; then
+          health_log "Warn" "看门狗: 10 分钟内已有效重启 ${HEALTH_RESTART_LIMIT} 次，跳过本次重启"
+          return 0
+        fi
+        health_log "Warn" "看门狗: 重载无效，重启核心以刷新接口绑定"
+        old_pid=$(health_current_pid)
+        if command -v setsid >/dev/null 2>&1; then
+          setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+        else
+          "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+        fi
+        if health_wait_restart_done "${old_pid}"; then
+          if [ "$(health_provider_probe)" = "ok" ]; then
+            health_log "Info" "看门狗: 重启后节点恢复"
+          else
+            health_record_restart
+            health_log "Warn" "看门狗: 重启后节点仍不可用，已计入有效失败"
+          fi
+        else
+          health_log "Warn" "看门狗: 重启未在 ${HEALTH_RESTART_WAIT}s 内就绪，不计入额度"
+        fi
+        return 0
+        ;;
+      *)
+        health_log "Info" "看门狗: 无法判断机场节点状态（组 ${HEALTH_PROBE_GROUP}），跳过"
+        return 0
+        ;;
+    esac
   fi
 
   if ! health_tun_present; then
