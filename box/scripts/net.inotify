@@ -391,10 +391,12 @@ HEALTH_RESTART_LIMIT=2
 HEALTH_RESTART_WAIT=45
 HEALTH_RECHECK_INTERVAL=120
 HEALTH_RECHECK_ROUNDS=5
-# 机场节点健康探测：对哪个地区组做延迟测试。直连探测只能证明能上网，
+# 机场节点健康探测：对哪个组做延迟测试。直连探测只能证明能上网，
 # 节点全黑时直连照样通，所以必须单独测一组真实节点。
-# 组名不存在（404）时视为无法判断，不做任何动作，避免误重启。
-HEALTH_PROBE_GROUP="Hong Kong"
+# 留空 = 自动从 /proxies 里挑 URLTest / Fallback 组（这类组含真实节点）；
+# 也可以在 settings.ini 里写 HEALTH_PROBE_GROUP="你的组名" 固定指定。
+# 候选组都取不到时视为无法判断，不做任何动作，避免误重启。
+HEALTH_PROBE_GROUP=""
 HEALTH_PROBE_TIMEOUT=25
 # 底层未就绪时的等待窗口：每 15 秒探测一次，最多 12 次（3 分钟）。
 # 只用于覆盖“网络恢复后底层还在初始化”的抖动，不是等信号回来——
@@ -521,39 +523,75 @@ health_api_auth() {
   printf '%s\n%s\n' "${port}" "${secret}"
 }
 
-# 机场节点健康探测：对地区组做一次真实延迟测试。
-# 返回 ok / fail / unknown（组不存在或 API 不可用时为 unknown，调用方不做动作）
+# 候选探测组：优先用显式配置；否则从 /proxies 里挑 URLTest / Fallback 组
+health_probe_candidates() {
+  local port="$1" secret="$2" tmp
+  if [ -n "${HEALTH_PROBE_GROUP}" ]; then
+    printf '%s\n' "${HEALTH_PROBE_GROUP}"
+    return 0
+  fi
+  tmp="${STATE_DIR}/health_proxies.json"
+  if [ -n "${secret}" ]; then
+    curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/proxies" -o "${tmp}" 2>/dev/null
+  else
+    curl -s -m 8 "http://127.0.0.1:${port}/proxies" -o "${tmp}" 2>/dev/null
+  fi
+  if [ ! -s "${tmp}" ]; then
+    rm -f "${tmp}" 2>/dev/null
+    return 1
+  fi
+  sed 's/},{/}\n{/g' "${tmp}" 2>/dev/null \
+    | grep -E '"type":"(URLTest|Fallback)"' \
+    | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' \
+    | head -n 3 | tr '\n' ' '
+  rm -f "${tmp}" 2>/dev/null
+}
+
+# 机场节点健康探测：对候选组做真实延迟测试，任一可用即 ok。
+# 返回 ok / fail / unknown（取不到候选组时 unknown，调用方不做动作）
 health_provider_probe() {
-  local auth port secret resp code url group
-  group="${HEALTH_PROBE_GROUP:-Hong Kong}"
+  local auth port secret groups g resp code url saw_response="false"
+
   auth=$(health_api_auth) || { printf 'unknown\n'; return 2; }
   port=$(printf '%s\n' "${auth}" | sed -n '1p')
   secret=$(printf '%s\n' "${auth}" | sed -n '2p')
-  url="http://127.0.0.1:${port}/group/$(printf '%s' "${group}" | sed 's/ /%20/g')/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=4000"
-  if [ -n "${secret}" ]; then
-    resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' -H "Authorization: Bearer ${secret}" "${url}" 2>/dev/null)
-  else
-    resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' "${url}" 2>/dev/null)
+
+  groups=$(health_probe_candidates "${port}" "${secret}")
+  if [ -z "${groups}" ]; then
+    printf 'unknown\n'
+    return 2
   fi
-  code=$(printf '%s\n' "${resp}" | tail -n 1)
-  case "${code}" in
-    200)
-      if printf '%s\n' "${resp}" | grep -qE '"[^"]+":[0-9]+'; then
-        printf 'ok\n'
-        return 0
-      fi
-      printf 'fail\n'
-      return 1
-      ;;
-    404)
-      printf 'unknown\n'
-      return 2
-      ;;
-    *)
-      printf 'unknown\n'
-      return 2
-      ;;
-  esac
+
+  for g in ${groups}; do
+    url="http://127.0.0.1:${port}/group/$(printf '%s' "${g}" | sed 's/ /%20/g')/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=4000"
+    if [ -n "${secret}" ]; then
+      resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' -H "Authorization: Bearer ${secret}" "${url}" 2>/dev/null)
+    else
+      resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' "${url}" 2>/dev/null)
+    fi
+    code=$(printf '%s\n' "${resp}" | tail -n 1)
+    case "${code}" in
+      200)
+        if printf '%s\n' "${resp}" | grep -qE '"[^"]+":[0-9]+'; then
+          printf 'ok\n'
+          return 0
+        fi
+        saw_response="true"
+        ;;
+      404)
+        : ;;
+      *)
+        saw_response="true"
+        ;;
+    esac
+  done
+
+  if [ "${saw_response}" = "true" ]; then
+    printf 'fail\n'
+    return 1
+  fi
+  printf 'unknown\n'
+  return 2
 }
 
 health_reload_mihomo() {
