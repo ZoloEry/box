@@ -384,20 +384,20 @@ apply_network_control_policy() {
 HEALTH_STATE_FILE="${STATE_DIR}/health_watch.last"
 HEALTH_RESTART_FILE="${STATE_DIR}/health_restart.history"
 HEALTH_LOCK_DIR="${STATE_DIR}/health.lock"
+# 陈旧锁阈值：进程被强杀/重启后 /data 保留，锁目录会残留，
+# 不清理的话看门狗此后永远 mkdir 失败、直接 return，等于完全失效。
+HEALTH_LOCK_STALE=900
 HEALTH_DELAY=8
+# 探测地址缓存：首次从配置解析后复用，避免每次探测都读取配置文件
+HEALTH_PROBE_URL_CACHE=""
 HEALTH_COOLDOWN=30
 HEALTH_RESTART_WINDOW=600
 HEALTH_RESTART_LIMIT=2
 HEALTH_RESTART_WAIT=45
+# 重启流程就绪后额外等待：给 mihomo 加载 provider、重探接口留时间
+HEALTH_RESTART_SETTLE=15
 HEALTH_RECHECK_INTERVAL=120
 HEALTH_RECHECK_ROUNDS=5
-# 机场节点健康探测：对哪个组做延迟测试。直连探测只能证明能上网，
-# 节点全黑时直连照样通，所以必须单独测一组真实节点。
-# 留空 = 自动从 /proxies 里挑 URLTest / Fallback 组（这类组含真实节点）；
-# 也可以在 settings.ini 里写 HEALTH_PROBE_GROUP="你的组名" 固定指定。
-# 候选组都取不到时视为无法判断，不做任何动作，避免误重启。
-HEALTH_PROBE_GROUP=""
-HEALTH_PROBE_TIMEOUT=25
 # 底层未就绪时的等待窗口：每 15 秒探测一次，最多 12 次（3 分钟）。
 # 只用于覆盖“网络恢复后底层还在初始化”的抖动，不是等信号回来——
 # 长时间无信号期间不做任何动作，恢复时的网络事件会重新触发本脚本。
@@ -423,6 +423,10 @@ health_log() {
 # 过滤掉本地订阅地址；都取不到才回退到 Android 通用的 204 检测地址。
 # 这样不把任何厂商域名写死在脚本里。
 health_probe_url() {
+  if [ -n "${HEALTH_PROBE_URL_CACHE}" ]; then
+    printf '%s\n' "${HEALTH_PROBE_URL_CACHE}"
+    return 0
+  fi
   local u
   u=$(sed -n "s/.*url:[[:space:]]*'\(https\{0,1\}:\/\/[^']*\)'.*/\1/p" "${mihomo_config}" 2>/dev/null \
     | grep -v -E '127\.0\.0\.1|localhost' | head -n 1)
@@ -431,6 +435,7 @@ health_probe_url() {
       | grep -v -E '127\.0\.0\.1|localhost' | head -n 1)
   fi
   [ -n "${u}" ] || u="https://www.gstatic.com/generate_204"
+  HEALTH_PROBE_URL_CACHE="${u}"
   printf '%s\n' "${u}"
 }
 
@@ -467,12 +472,17 @@ health_proxy_probe() {
 
 # 底层就绪判断：Android 网络验证标志（VALIDATED），不发请求
 health_underlay_probe() {
-  # 底层是否真的可用：用 Android 的网络验证标志（VALIDATED）判断，
-  # AOSP 标准字段，任何 ROM 都有；不需要发请求，也不会被墙干扰。
-  local netid
+  # 首选 Android 网络验证标志（VALIDATED，AOSP 标准，不发请求、不受墙影响）。
+  # 但部分 ROM 不跑网络验证服务，该标志永远不置位——此时回退到
+  # “有默认网络 + 该网卡有默认路由”的结构判断，避免永远判未就绪使看门狗失效。
+  local netid iface
   netid=$(dumpsys connectivity 2>/dev/null | sed -n 's/^Active default network: \([0-9][0-9]*\).*/\1/p' | head -n 1)
-  [ -n "${netid}" ] || return 1
-  dumpsys connectivity 2>/dev/null | grep -m1 "network{${netid}}" | grep -q 'VALIDATED'
+  if [ -n "${netid}" ]; then
+    dumpsys connectivity 2>/dev/null | grep -m1 "network{${netid}}" | grep -q 'VALIDATED' && return 0
+  fi
+  iface=$(health_underlay_iface)
+  [ -n "${iface}" ] || return 1
+  ip route show table all 2>/dev/null | grep -q "dev ${iface} "
 }
 
 health_cooldown_ok() {
@@ -523,6 +533,9 @@ health_wait_restart_done() {
   while [ "${waited}" -lt ${HEALTH_RESTART_WAIT} ]; do
     now_pid=$(health_current_pid)
     if [ -n "${now_pid}" ] && [ "${now_pid}" != "${old_pid}" ] && kill -0 "${now_pid}" 2>/dev/null && health_tun_present; then
+      # 核心已起、TUN 已建，但 provider 仍需从订阅加载。
+      # 立即探测会把加载中误判为不可用，误消耗重启额度。
+      busybox sleep ${HEALTH_RESTART_SETTLE}
       return 0
     fi
     busybox sleep 2
@@ -545,35 +558,12 @@ health_api_auth() {
   printf '%s\n%s\n' "${port}" "${secret}"
 }
 
-# 候选探测组：优先用显式配置；否则从 /proxies 里挑 URLTest / Fallback 组
-health_probe_candidates() {
-  local port="$1" secret="$2" tmp
-  if [ -n "${HEALTH_PROBE_GROUP}" ]; then
-    printf '%s\n' "${HEALTH_PROBE_GROUP}"
-    return 0
-  fi
-  tmp="${STATE_DIR}/health_proxies.json"
-  if [ -n "${secret}" ]; then
-    curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/proxies" -o "${tmp}" 2>/dev/null
-  else
-    curl -s -m 8 "http://127.0.0.1:${port}/proxies" -o "${tmp}" 2>/dev/null
-  fi
-  if [ ! -s "${tmp}" ]; then
-    rm -f "${tmp}" 2>/dev/null
-    return 1
-  fi
-  sed 's/},{/}\n{/g' "${tmp}" 2>/dev/null \
-    | grep -E '"type":"Fallback"' \
-    | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' \
-    | head -n 3 | tr '\n' ' '
-  rm -f "${tmp}" 2>/dev/null
-}
 
 urlencode() {
   printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n' | sed 's/../%&/g'
 }
 
-# provider 级二次确认：触发各机场健康检查，再统计 alive 节点。
+# provider 级二次确认：触发各 proxy-provider 的健康检查，再统计 alive 节点。
 # 返回 0=有可用节点 1=全部不可用 2=取不到数据
 health_provider_alive_check() {
   local port="$1" secret="$2" names name enc resp alive
@@ -614,70 +604,36 @@ health_provider_alive_check() {
   return 1
 }
 
-# 机场节点健康探测：对候选组做真实延迟测试，任一可用即 ok。
-# 返回 ok / fail / unknown（取不到候选组时 unknown，调用方不做动作）
+# 节点可用性探测
+#   1) 存在 proxy-providers：触发健康检查后统计 alive 节点
+#   2) 无 provider 或 provider 全部不可用：对 /proxies 中的节点做延迟测试
+#   3) 两者都取不到：返回 unknown，调用方不做动作
+# 不依赖任何组名或组类型，适配不同配置结构。
 health_provider_probe() {
-  local auth port secret groups g resp code url saw_response="false"
+  local auth port secret state
 
   auth=$(health_api_auth) || { printf 'unknown\n'; return 2; }
   port=$(printf '%s\n' "${auth}" | sed -n '1p')
   secret=$(printf '%s\n' "${auth}" | sed -n '2p')
 
-  groups=$(health_probe_candidates "${port}" "${secret}")
-  if [ -z "${groups}" ]; then
-    printf 'unknown\n'
-    return 2
+  health_provider_alive_check "${port}" "${secret}"
+  state=$?
+
+  if [ "${state}" = "0" ]; then
+    printf 'ok\n'
+    return 0
   fi
 
-  for g in ${groups}; do
-    url="http://127.0.0.1:${port}/group/$(printf '%s' "${g}" | sed 's/ /%20/g')/delay?url=$(urlencode "$(health_probe_url)")&timeout=4000"
-    if [ -n "${secret}" ]; then
-      resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' -H "Authorization: Bearer ${secret}" "${url}" 2>/dev/null)
-    else
-      resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' "${url}" 2>/dev/null)
-    fi
-    code=$(printf '%s\n' "${resp}" | tail -n 1)
-    case "${code}" in
-      200)
-        if printf '%s\n' "${resp}" | grep -qE '"[^"]+":[0-9]+'; then
-          printf 'ok\n'
-          return 0
-        fi
-        saw_response="true"
-        ;;
-      404)
-        : ;;
-      *)
-        saw_response="true"
-        ;;
-    esac
-  done
-
-  # 组探测没拿到延迟：先用 provider 健康检查二次确认，避免缓存类误判
-  health_provider_alive_check "${port}" "${secret}"
-  case $? in
-    0)
-      printf 'ok\n'
-      return 0
-      ;;
-    1)
-      printf 'fail\n'
-      return 1
-      ;;
-    *)
-      ;;
-  esac
-
-  # 没有 provider 的配置（纯手写节点）：直接测 /proxies 里的真实节点
   if health_probe_direct_nodes "${port}" "${secret}"; then
     printf 'ok\n'
     return 0
   fi
 
-  if [ "${saw_response}" = "true" ]; then
+  if [ "${state}" = "1" ]; then
     printf 'fail\n'
     return 1
   fi
+
   printf 'unknown\n'
   return 2
 }
@@ -787,7 +743,7 @@ health_refresh_delays() {
 }
 
 # 最后一层兜底：直接测 /proxies 里的真实节点（手写节点在集合里，
-# 机场节点不在，所以这里不会误测 provider 节点）。
+# provider 节点不在该集合里，所以不会误测）。
 # 返回 0=有节点可用 1=没有可用节点或取不到
 health_probe_direct_nodes() {
   local port="$1" secret="$2" tmp names name enc code resp
@@ -825,19 +781,19 @@ health_probe_direct_nodes() {
   return 1
 }
 
-# 直连正常时，进一步确认机场节点可用（节点全黑时直连照样通）
+# 端到端探测通过时，进一步确认节点可用（节点全黑时链路仍可能通）
 health_check_provider_path() {
   local pstate old_pid
   pstate=$(health_provider_probe)
   case "${pstate}" in
     ok)
-      health_log "Info" "看门狗: 出网正常（机场节点可用）"
+      health_log "Info" "看门狗: 出网正常（节点可用）"
       health_clear_defer
       health_refresh_delays
       return 0
       ;;
     fail)
-      health_log "Warn" "看门狗: 直连正常但机场节点全部不可用，尝试重载 mihomo 配置"
+      health_log "Warn" "看门狗: 出网探测通过但节点全部不可用，尝试重载 mihomo 配置"
       health_reload_mihomo >/dev/null 2>&1
       busybox sleep 8
       if [ "$(health_provider_probe)" = "ok" ]; then
@@ -872,7 +828,7 @@ health_check_provider_path() {
       return 0
       ;;
     *)
-      health_log "Info" "看门狗: 无法判断机场节点状态（组 ${HEALTH_PROBE_GROUP}），跳过"
+      health_log "Info" "看门狗: 无法判断节点状态（无候选组/无 provider/无手写节点），跳过"
       return 0
       ;;
   esac
@@ -880,7 +836,7 @@ health_check_provider_path() {
 
 watch_tun_health() {
   local enabled="true"
-  local iface round waited old_pid
+  local iface round waited old_pid lock_age
 
   [ "${enabled}" = "true" ] || return 0
   [ "${network_mode}" = "tun" ] || return 0
@@ -889,6 +845,15 @@ watch_tun_health() {
   is_service_running || return 0
 
   ensure_dirs
+  # 清理陈旧锁：进程被强杀或设备重启后，锁目录会留在 /data 里，
+  # 否则 mkdir 会持续失败，看门狗无法启动。
+  if [ -d "${HEALTH_LOCK_DIR}" ]; then
+    lock_age=$(( $(date +%s) - $(stat -c %Y "${HEALTH_LOCK_DIR}" 2>/dev/null || echo 0) ))
+    if [ "${lock_age}" -gt ${HEALTH_LOCK_STALE} ]; then
+      rmdir "${HEALTH_LOCK_DIR}" 2>/dev/null || true
+      health_log "Warn" "看门狗: 清理陈旧锁（已残留 ${lock_age}s）"
+    fi
+  fi
   mkdir "${HEALTH_LOCK_DIR}" 2>/dev/null || return 0
   trap 'rmdir "${HEALTH_LOCK_DIR}" 2>/dev/null' EXIT
 
@@ -898,13 +863,13 @@ watch_tun_health() {
   busybox sleep ${HEALTH_DELAY}
   is_service_running || return 0
 
-  # 第一跳：直连探测。通就说明底层没问题，直接进入机场节点探测。
+  # 第一跳：端到端探测。通过说明链路与节点均正常，直接进入节点确认。
   if health_proxy_probe; then
     health_check_provider_path
     return 0
   fi
 
-  # 直连不通：可能真没信号，也可能刚恢复、底层还在初始化。
+  # 端到端不通：可能确实没信号，也可能刚恢复、底层仍在初始化。
   # 在 3 分钟窗口内反复确认，一旦底层就绪就继续往下判断。
   iface=$(health_await_underlay)
   if [ -z "${iface}" ]; then
