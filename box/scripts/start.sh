@@ -105,7 +105,15 @@ if [ -f "$file_settings" ] && [ -r "$file_settings" ] && [ -s "$file_settings" ]
     # 开机后延迟做一次代理健康检查：开机时通常没有网络变化事件，
     # inotifyd 不会触发 net.inotify，核心若在开机时绑错接口就会一直
     # 节点全黑，直到手动重启。这里主动触发一次，让看门狗有机会自愈。
-    ( ${busybox} sleep 75; "${scripts_dir}/net.inotify" w ) >/dev/null 2>&1 &
+    (
+      i=0
+      while [ "${i}" -lt 60 ]; do
+        ${busybox} sleep 5
+        i=$((i + 1))
+        dumpsys connectivity 2>/dev/null | grep -q '^Active default network: [0-9]' && break
+      done
+      "${scripts_dir}/net.inotify" w
+    ) >/dev/null 2>&1 &
   fi
 else
   start_inotifyd

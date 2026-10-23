@@ -419,6 +419,21 @@ health_log() {
 # 找一个可用的底层出口网卡：
 # 1) 优先向系统要“当前默认网络”的接口（多卡机器上最准）
 # 2) 拿不到再回退到路由表推导（排除 TUN、dummy 等）
+# 探测目标 URL：优先用用户自己配置的测速地址（proxy-groups / health-check 的 url），
+# 过滤掉本地订阅地址；都取不到才回退到 Android 通用的 204 检测地址。
+# 这样不把任何厂商域名写死在脚本里。
+health_probe_url() {
+  local u
+  u=$(sed -n "s/.*url:[[:space:]]*'\(https\{0,1\}:\/\/[^']*\)'.*/\1/p" "${mihomo_config}" 2>/dev/null \
+    | grep -v -E '127\.0\.0\.1|localhost' | head -n 1)
+  if [ -z "${u}" ]; then
+    u=$(sed -n 's/.*url:[[:space:]]*"\(https\{0,1\}:\/\/[^"]*\)".*/\1/p' "${mihomo_config}" 2>/dev/null \
+      | grep -v -E '127\.0\.0\.1|localhost' | head -n 1)
+  fi
+  [ -n "${u}" ] || u="https://www.gstatic.com/generate_204"
+  printf '%s\n' "${u}"
+}
+
 health_underlay_iface() {
   local iface netid
   netid=$(dumpsys connectivity 2>/dev/null | sed -n 's/^Active default network: \([0-9][0-9]*\).*/\1/p' | head -n 1)
@@ -441,16 +456,23 @@ health_tun_present() {
 
 # 代理层探测：走 TUN 默认路由，必须 fail 快、且不依赖 DNS 之外的中间件
 health_proxy_probe() {
-  curl -s -m 6 -o /dev/null -w '%{http_code}' 'http://connect.rom.miui.com/generate_204' 2>/dev/null | grep -q '^204$'
+  local target code
+  target=$(health_probe_url)
+  code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "${target}" 2>/dev/null)
+  case "${code}" in
+    2*|3*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-# 底层探测：显式绑定物理网卡，绕过 TUN
+# 底层就绪判断：Android 网络验证标志（VALIDATED），不发请求
 health_underlay_probe() {
-  local iface="$1"
-  [ -n "${iface}" ] || return 1
-  curl -s -m 8 --interface "${iface}" -o /dev/null 'http://connect.rom.miui.com/generate_204' 2>/dev/null && return 0
-  curl -s -m 8 --interface "${iface}" -o /dev/null 'http://www.baidu.com' 2>/dev/null && return 0
-  return 1
+  # 底层是否真的可用：用 Android 的网络验证标志（VALIDATED）判断，
+  # AOSP 标准字段，任何 ROM 都有；不需要发请求，也不会被墙干扰。
+  local netid
+  netid=$(dumpsys connectivity 2>/dev/null | sed -n 's/^Active default network: \([0-9][0-9]*\).*/\1/p' | head -n 1)
+  [ -n "${netid}" ] || return 1
+  dumpsys connectivity 2>/dev/null | grep -m1 "network{${netid}}" | grep -q 'VALIDATED'
 }
 
 health_cooldown_ok() {
@@ -541,10 +563,55 @@ health_probe_candidates() {
     return 1
   fi
   sed 's/},{/}\n{/g' "${tmp}" 2>/dev/null \
-    | grep -E '"type":"(URLTest|Fallback)"' \
+    | grep -E '"type":"Fallback"' \
     | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' \
     | head -n 3 | tr '\n' ' '
   rm -f "${tmp}" 2>/dev/null
+}
+
+urlencode() {
+  printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n' | sed 's/../%&/g'
+}
+
+# provider 级二次确认：触发各机场健康检查，再统计 alive 节点。
+# 返回 0=有可用节点 1=全部不可用 2=取不到数据
+health_provider_alive_check() {
+  local port="$1" secret="$2" names name enc resp alive
+
+  if [ -n "${secret}" ]; then
+    resp=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null)
+  else
+    resp=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null)
+  fi
+  [ -n "${resp}" ] || return 2
+
+  names=$(printf '%s' "${resp}" | sed 's/},{/}\n{/g' | grep '"vehicleType":"HTTP"' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+  [ -n "${names}" ] || return 2
+
+  for name in ${names}; do
+    enc=$(urlencode "${name}")
+    if [ -n "${secret}" ]; then
+      curl -s -m 10 -o /dev/null -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies/${enc}/healthcheck" 2>/dev/null
+    else
+      curl -s -m 10 -o /dev/null "http://127.0.0.1:${port}/providers/proxies/${enc}/healthcheck" 2>/dev/null
+    fi
+  done
+
+  busybox sleep 12
+
+  for name in ${names}; do
+    enc=$(urlencode "${name}")
+    if [ -n "${secret}" ]; then
+      resp=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies/${enc}" 2>/dev/null)
+    else
+      resp=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies/${enc}" 2>/dev/null)
+    fi
+    [ -n "${resp}" ] || continue
+    alive=$(printf '%s' "${resp}" | grep -o '"alive":true' | wc -l)
+    [ "${alive}" -gt 0 ] && return 0
+  done
+
+  return 1
 }
 
 # 机场节点健康探测：对候选组做真实延迟测试，任一可用即 ok。
@@ -563,7 +630,7 @@ health_provider_probe() {
   fi
 
   for g in ${groups}; do
-    url="http://127.0.0.1:${port}/group/$(printf '%s' "${g}" | sed 's/ /%20/g')/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=4000"
+    url="http://127.0.0.1:${port}/group/$(printf '%s' "${g}" | sed 's/ /%20/g')/delay?url=$(urlencode "$(health_probe_url)")&timeout=4000"
     if [ -n "${secret}" ]; then
       resp=$(curl -s -m "${HEALTH_PROBE_TIMEOUT}" -w '\n%{http_code}' -H "Authorization: Bearer ${secret}" "${url}" 2>/dev/null)
     else
@@ -585,6 +652,27 @@ health_provider_probe() {
         ;;
     esac
   done
+
+  # 组探测没拿到延迟：先用 provider 健康检查二次确认，避免缓存类误判
+  health_provider_alive_check "${port}" "${secret}"
+  case $? in
+    0)
+      printf 'ok\n'
+      return 0
+      ;;
+    1)
+      printf 'fail\n'
+      return 1
+      ;;
+    *)
+      ;;
+  esac
+
+  # 没有 provider 的配置（纯手写节点）：直接测 /proxies 里的真实节点
+  if health_probe_direct_nodes "${port}" "${secret}"; then
+    printf 'ok\n'
+    return 0
+  fi
 
   if [ "${saw_response}" = "true" ]; then
     printf 'fail\n'
@@ -626,9 +714,9 @@ health_await_underlay() {
     if ! is_service_running; then
       return 1
     fi
-    iface=$(health_underlay_iface)
-    if [ -n "${iface}" ] && health_underlay_probe "${iface}"; then
-      printf '%s\n' "${iface}"
+    if health_underlay_probe; then
+      iface=$(health_underlay_iface)
+      printf '%s\n' "${iface:-default}"
       return 0
     fi
     attempt=$((attempt + 1))
@@ -662,6 +750,81 @@ health_clear_defer() {
   rm -f "${HEALTH_DEFER_FILE}" 2>/dev/null || true
 }
 
+# 判定正常后主动触发一次全量健康检查，让面板上的节点延迟刷新出来，
+# 避免“节点可用但面板一片黑”。只发触发请求，不等结果。
+# 3 分钟内最多一次，防止网络抖动时反复测速。
+health_refresh_delays() {
+  local auth port secret names name enc now last
+  now=$(date +%s)
+  last=0
+  [ -f "${STATE_DIR}/health_refresh.last" ] && last=$(cat "${STATE_DIR}/health_refresh.last" 2>/dev/null)
+  case "${last}" in
+    ''|*[!0-9]*) last=0 ;;
+  esac
+  [ $((now - last)) -lt 180 ] && return 0
+
+  auth=$(health_api_auth) || return 0
+  port=$(printf '%s\n' "${auth}" | sed -n '1p')
+  secret=$(printf '%s\n' "${auth}" | sed -n '2p')
+
+  if [ -n "${secret}" ]; then
+    names=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null | sed 's/},{/}\n{/g' | grep '"vehicleType":"HTTP"' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+  else
+    names=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null | sed 's/},{/}\n{/g' | grep '"vehicleType":"HTTP"' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+  fi
+  [ -n "${names}" ] || return 0
+
+  date +%s > "${STATE_DIR}/health_refresh.last" 2>/dev/null || true
+  for name in ${names}; do
+    enc=$(urlencode "${name}")
+    if [ -n "${secret}" ]; then
+      curl -s -m 5 -o /dev/null -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies/${enc}/healthcheck" 2>/dev/null
+    else
+      curl -s -m 5 -o /dev/null "http://127.0.0.1:${port}/providers/proxies/${enc}/healthcheck" 2>/dev/null
+    fi
+  done
+  health_log "Info" "看门狗: 已触发延迟刷新，面板节点状态会在十几秒内更新"
+}
+
+# 最后一层兜底：直接测 /proxies 里的真实节点（手写节点在集合里，
+# 机场节点不在，所以这里不会误测 provider 节点）。
+# 返回 0=有节点可用 1=没有可用节点或取不到
+health_probe_direct_nodes() {
+  local port="$1" secret="$2" tmp names name enc code resp
+  tmp="${STATE_DIR}/health_direct.json"
+  if [ -n "${secret}" ]; then
+    curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/proxies" -o "${tmp}" 2>/dev/null
+  else
+    curl -s -m 8 "http://127.0.0.1:${port}/proxies" -o "${tmp}" 2>/dev/null
+  fi
+  if [ ! -s "${tmp}" ]; then
+    rm -f "${tmp}" 2>/dev/null
+    return 1
+  fi
+
+  names=$(sed 's/},{/}\n{/g' "${tmp}" 2>/dev/null \
+    | grep -E '"type":"(Shadowsocks|Vmess|Trojan|Vless|Tuic|Hysteria|Hysteria2|WireGuard|Socks5|Http)"' \
+    | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' \
+    | head -n 3)
+  rm -f "${tmp}" 2>/dev/null
+  [ -n "${names}" ] || return 1
+
+  for name in ${names}; do
+    enc=$(urlencode "${name}")
+    if [ -n "${secret}" ]; then
+      resp=$(curl -s -m 8 -w '\n%{http_code}' -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/proxies/${enc}/delay?url=$(urlencode "$(health_probe_url)")&timeout=4000" 2>/dev/null)
+    else
+      resp=$(curl -s -m 8 -w '\n%{http_code}' "http://127.0.0.1:${port}/proxies/${enc}/delay?url=$(urlencode "$(health_probe_url)")&timeout=4000" 2>/dev/null)
+    fi
+    code=$(printf '%s\n' "${resp}" | tail -n 1)
+    if [ "${code}" = "200" ]; then
+      printf '%s\n' "${resp}" | grep -qE '"[^"]+":[0-9]+' && return 0
+      printf '%s\n' "${resp}" | grep -q '"delay"' && return 0
+    fi
+  done
+  return 1
+}
+
 # 直连正常时，进一步确认机场节点可用（节点全黑时直连照样通）
 health_check_provider_path() {
   local pstate old_pid
@@ -670,6 +833,7 @@ health_check_provider_path() {
     ok)
       health_log "Info" "看门狗: 出网正常（机场节点可用）"
       health_clear_defer
+      health_refresh_delays
       return 0
       ;;
     fail)
@@ -679,6 +843,7 @@ health_check_provider_path() {
       if [ "$(health_provider_probe)" = "ok" ]; then
         health_log "Info" "看门狗: 重载后节点恢复"
         health_clear_defer
+        health_refresh_delays
         return 0
       fi
       if ! health_restart_allowed; then
@@ -696,6 +861,7 @@ health_check_provider_path() {
         if [ "$(health_provider_probe)" = "ok" ]; then
           health_log "Info" "看门狗: 重启后节点恢复"
           health_clear_defer
+          health_refresh_delays
         else
           health_record_restart
           health_log "Warn" "看门狗: 重启后节点仍不可用，已计入有效失败"
@@ -765,6 +931,7 @@ watch_tun_health() {
   if health_proxy_probe; then
     health_log "Info" "看门狗: 重载后恢复正常"
     health_clear_defer
+    health_refresh_delays
     return 0
   fi
 
@@ -783,6 +950,7 @@ watch_tun_health() {
       if health_proxy_probe; then
         health_log "Info" "看门狗: 轮询 ${waited}s 后出网自行恢复"
         health_clear_defer
+        health_refresh_delays
         return 0
       fi
     done
@@ -807,6 +975,7 @@ watch_tun_health() {
   if health_proxy_probe; then
     health_log "Info" "看门狗: 重启后恢复正常"
     health_clear_defer
+    health_refresh_delays
     return 0
   fi
 
