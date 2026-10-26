@@ -459,6 +459,25 @@ health_tun_present() {
   ip link show "${tun_device:-mihoyo}" >/dev/null 2>&1
 }
 
+# 记录 TUN 重建失败时的现场：哪些进程打开了 xtables 锁文件、核心侧报了什么错。
+# 注意列出的是“打开该文件”的进程，未必都处于持锁状态，仅供定位参考。
+health_log_tun_failure() {
+  local holders="" p line
+  for p in /proc/[0-9]*; do
+    [ -e "${p}/fd" ] || continue
+    if ls -l "${p}/fd" 2>/dev/null | grep -q 'xtables.lock'; then
+      holders="${holders}${p#/proc/}($(tr '\0' ' ' < "${p}/cmdline" 2>/dev/null | cut -c1-48)); "
+    fi
+  done
+  if [ -n "${holders}" ]; then
+    health_log "Warn" "看门狗: 打开 xtables 锁文件的进程 ${holders}"
+  else
+    health_log "Warn" "看门狗: 未发现打开 xtables 锁文件的进程"
+  fi
+  line=$(grep -i 'tun' "${bin_log}" 2>/dev/null | tail -n 1 | cut -c1-150)
+  [ -n "${line}" ] && health_log "Warn" "看门狗: 核心最近 TUN 日志 ${line}"
+}
+
 # 代理层探测：走 TUN 默认路由，必须 fail 快、且不依赖 DNS 之外的中间件
 health_proxy_probe() {
   local target code
@@ -882,6 +901,7 @@ watch_tun_health() {
       health_clear_defer
       health_refresh_delays
     else
+      health_log_tun_failure
       health_record_restart
       health_log "Warn" "看门狗: TUN 仍未建立，已计入有效失败"
     fi
