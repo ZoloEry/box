@@ -863,6 +863,31 @@ watch_tun_health() {
   busybox sleep ${HEALTH_DELAY}
   is_service_running || return 0
 
+  # TUN 是代理链路的前提。核心在运行却没有 TUN，说明创建失败
+  # （常见原因：启动时 iptables 锁被占用），此时后续探测都无意义，直接重建。
+  if ! health_tun_present; then
+    health_log "Warn" "看门狗: TUN 设备不存在，重建核心"
+    if ! health_restart_allowed; then
+      health_log "Warn" "看门狗: 10 分钟内已有效重启 ${HEALTH_RESTART_LIMIT} 次，跳过本次重建"
+      return 0
+    fi
+    old_pid=$(health_current_pid)
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+    else
+      "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+    fi
+    if health_wait_restart_done "${old_pid}"; then
+      health_log "Info" "看门狗: TUN 已重建"
+      health_clear_defer
+      health_refresh_delays
+    else
+      health_record_restart
+      health_log "Warn" "看门狗: TUN 仍未建立，已计入有效失败"
+    fi
+    return 0
+  fi
+
   # 第一跳：端到端探测。通过说明链路与节点均正常，直接进入节点确认。
   if health_proxy_probe; then
     health_check_provider_path
@@ -882,11 +907,6 @@ watch_tun_health() {
 
   if health_proxy_probe; then
     health_check_provider_path
-    return 0
-  fi
-
-  if ! health_tun_present; then
-    health_log "Warn" "看门狗: TUN 设备 ${tun_device:-mihoyo} 不存在，跳过（由服务状态决定是否重启）"
     return 0
   fi
 
