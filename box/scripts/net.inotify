@@ -386,6 +386,8 @@ HEALTH_RESTART_FILE="${STATE_DIR}/health_restart.history"
 HEALTH_LOCK_DIR="${STATE_DIR}/health.lock"
 # 陈旧锁阈值：进程被强杀/重启后 /data 保留，锁目录会残留，
 # 不清理的话看门狗此后永远 mkdir 失败、直接 return，等于完全失效。
+# 注：不能用 flock 替代 —— mksh 的 `exec N>` 带 CLOEXEC，busybox flock
+# 的 FD 模式在子进程里必然 EBADF（已实测）。
 HEALTH_LOCK_STALE=900
 HEALTH_DELAY=8
 # 探测地址缓存：首次从配置解析后复用，避免每次探测都读取配置文件
@@ -585,16 +587,18 @@ urlencode() {
 # provider 级二次确认：触发各 proxy-provider 的健康检查，再统计 alive 节点。
 # 返回 0=有可用节点 1=全部不可用 2=取不到数据
 health_provider_alive_check() {
-  local port="$1" secret="$2" names name enc resp alive
+  local port="$1" secret="$2" names name enc alive
 
+  # 流式处理，不经变量中转：多机场时 /providers/proxies 可远超 128KB
+  # (MAX_ARG_STRLEN)，把大响应当参数交给外部 printf 会 E2BIG，导致
+  # 整个看门狗误判为“无 provider”而静默跳过。写法同 health_refresh_delays。
   if [ -n "${secret}" ]; then
-    resp=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null)
+    names=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null \
+      | sed 's/},{/}\n{/g' | grep '"vehicleType":"HTTP"' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
   else
-    resp=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null)
+    names=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies" 2>/dev/null \
+      | sed 's/},{/}\n{/g' | grep '"vehicleType":"HTTP"' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
   fi
-  [ -n "${resp}" ] || return 2
-
-  names=$(printf '%s' "${resp}" | sed 's/},{/}\n{/g' | grep '"vehicleType":"HTTP"' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
   [ -n "${names}" ] || return 2
 
   for name in ${names}; do
@@ -611,12 +615,12 @@ health_provider_alive_check() {
   for name in ${names}; do
     enc=$(urlencode "${name}")
     if [ -n "${secret}" ]; then
-      resp=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies/${enc}" 2>/dev/null)
+      alive=$(curl -s -m 8 -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${port}/providers/proxies/${enc}" 2>/dev/null \
+        | grep -o '"alive":true' | wc -l)
     else
-      resp=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies/${enc}" 2>/dev/null)
+      alive=$(curl -s -m 8 "http://127.0.0.1:${port}/providers/proxies/${enc}" 2>/dev/null \
+        | grep -o '"alive":true' | wc -l)
     fi
-    [ -n "${resp}" ] || continue
-    alive=$(printf '%s' "${resp}" | grep -o '"alive":true' | wc -l)
     [ "${alive}" -gt 0 ] && return 0
   done
 
@@ -873,7 +877,12 @@ watch_tun_health() {
       health_log "Warn" "看门狗: 清理陈旧锁（已残留 ${lock_age}s）"
     fi
   fi
-  mkdir "${HEALTH_LOCK_DIR}" 2>/dev/null || return 0
+  # 拿不到锁说明已有实例在跑。必须留痕：静默 return 会让看门狗无声
+  # 失效，事后完全没有线索（这正是之前踩过的坑）。
+  mkdir "${HEALTH_LOCK_DIR}" 2>/dev/null || {
+    health_log "Info" "看门狗: 已有实例在运行，跳过本次检查"
+    return 0
+  }
   trap 'rmdir "${HEALTH_LOCK_DIR}" 2>/dev/null' EXIT
 
   health_cooldown_ok || return 0
