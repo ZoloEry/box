@@ -1425,6 +1425,24 @@ get_dns_mode() {
   export dns_mode
 }
 
+# 等待 TUN 设备就绪。
+# mihomo 创建 TUN 时会直接调用 iptables（不带 -w，失败即放弃、不重试），
+# 若此时另有进程持有 xtables 锁，TUN 会创建失败而核心继续运行，
+# 表现为“节点可用但流量进不去”。因此启动流程必须等 TUN 出现后再
+# 并行下发自身规则，避免与核心抢锁。
+wait_tun_ready() {
+  local timeout="${1:-20}"
+  local elapsed=0
+  [ -n "${tun_device}" ] || return 0
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    ip link show "${tun_device}" >/dev/null 2>&1 && return 0
+    busybox sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  log Warning "等待 TUN 设备 ${tun_device} 超时（${timeout}s），继续下发规则"
+  return 1
+}
+
 start_box() {
   find_packages_uid
   get_dns_mode
@@ -1588,12 +1606,14 @@ case "$1" in
     stop_box
     wait "${_r_ipt}" 2>/dev/null
 
-    start_box &
-    _r_sb=$!
-    "${scripts_dir}/box.iptables" renew >/dev/null 2>&1 &
-    _r_ipt=$!
-    wait "${_r_sb}"; _r_rc=$?
-    wait "${_r_ipt}" 2>/dev/null
+    # 先启动核心并等 TUN 就绪，再下发自身规则：
+    # 两者并行会争用 xtables 锁，导致 mihomo 建 TUN 失败。
+    start_box
+    _r_rc=$?
+    if [ "${_r_rc}" -eq 0 ]; then
+      wait_tun_ready 20
+      "${scripts_dir}/box.iptables" renew >/dev/null 2>&1
+    fi
     if [ "${_r_rc}" -eq 0 ]; then
       $scripts_dir/box.tool webroot >/dev/null 2>&1
     else
