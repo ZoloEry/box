@@ -1477,7 +1477,7 @@ start_box() {
     rm -f "${pid_name}"
     stop_box
     start_box && "${scripts_dir}/box.iptables" renew
-    exit 1
+    exit 0
   fi
 
   # 检查 bin_name 是否已定义
@@ -1611,8 +1611,15 @@ case "$1" in
     start_box
     _r_rc=$?
     if [ "${_r_rc}" -eq 0 ]; then
-      wait_tun_ready 20
-      "${scripts_dir}/box.iptables" renew >/dev/null 2>&1
+      if wait_tun_ready 20; then
+        "${scripts_dir}/box.iptables" renew >/dev/null 2>&1
+      else
+        # TUN 未建立就下发规则，会与 mihomo 建 TUN 争用 xtables 锁：
+        # 规则一旦占锁，mihomo 的 iptables 调用（不带 -w）直接失败且不重试，
+        # TUN 就再也建不起来。这里直接放弃本次启动，交给上层重试。
+        log Error "TUN 设备未建立，跳过 iptables 规则下发。"
+        _r_rc=1
+      fi
     fi
     if [ "${_r_rc}" -eq 0 ]; then
       $scripts_dir/box.tool webroot >/dev/null 2>&1

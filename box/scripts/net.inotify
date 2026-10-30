@@ -384,11 +384,7 @@ apply_network_control_policy() {
 HEALTH_STATE_FILE="${STATE_DIR}/health_watch.last"
 HEALTH_RESTART_FILE="${STATE_DIR}/health_restart.history"
 HEALTH_LOCK_DIR="${STATE_DIR}/health.lock"
-# 陈旧锁阈值：进程被强杀/重启后 /data 保留，锁目录会残留，
-# 不清理的话看门狗此后永远 mkdir 失败、直接 return，等于完全失效。
-# 注：不能用 flock 替代 —— mksh 的 `exec N>` 带 CLOEXEC，busybox flock
-# 的 FD 模式在子进程里必然 EBADF（已实测）。
-HEALTH_LOCK_STALE=900
+HEALTH_LOCK_STALE=300
 HEALTH_DELAY=8
 # 探测地址缓存：首次从配置解析后复用，避免每次探测都读取配置文件
 HEALTH_PROBE_URL_CACHE=""
@@ -396,6 +392,8 @@ HEALTH_COOLDOWN=30
 HEALTH_RESTART_WINDOW=600
 HEALTH_RESTART_LIMIT=2
 HEALTH_RESTART_WAIT=45
+HEALTH_TUN_RETRY=3
+HEALTH_TUN_RETRY_DELAY=15
 # 重启流程就绪后额外等待：给 mihomo 加载 provider、重探接口留时间
 HEALTH_RESTART_SETTLE=15
 HEALTH_RECHECK_INTERVAL=120
@@ -482,13 +480,20 @@ health_log_tun_failure() {
 
 # 代理层探测：走 TUN 默认路由，必须 fail 快、且不依赖 DNS 之外的中间件
 health_proxy_probe() {
-  local target code
+  local target code attempt
   target=$(health_probe_url)
-  code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "${target}" 2>/dev/null)
-  case "${code}" in
-    2*|3*) return 0 ;;
-    *) return 1 ;;
-  esac
+  # 单次失败可能只是首连慢（DNS、TLS、链路刚起），重试一次再判不通，
+  # 避免把瞬时抖动当成故障去重载或重启核心。
+  attempt=0
+  while [ "${attempt}" -lt 2 ]; do
+    code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "${target}" 2>/dev/null)
+    case "${code}" in
+      2*|3*) return 0 ;;
+    esac
+    attempt=$((attempt + 1))
+    [ "${attempt}" -lt 2 ] && busybox sleep 2
+  done
+  return 1
 }
 
 # 底层就绪判断：Android 网络验证标志（VALIDATED），不发请求
@@ -860,6 +865,7 @@ health_check_provider_path() {
 watch_tun_health() {
   local enabled="true"
   local iface round waited old_pid lock_age
+  local attempt
 
   [ "${enabled}" = "true" ] || return 0
   [ "${network_mode}" = "tun" ] || return 0
@@ -868,22 +874,23 @@ watch_tun_health() {
   is_service_running || return 0
 
   ensure_dirs
-  # 清理陈旧锁：进程被强杀或设备重启后，锁目录会留在 /data 里，
-  # 否则 mkdir 会持续失败，看门狗无法启动。
+  # 目录锁：进程被强杀或设备重启后 /data 里会留下锁目录。
+  # 超过 HEALTH_LOCK_STALE 秒一律按陈旧处理并强制清理，
+  # 否则 mkdir 会持续失败，看门狗长期静默失效。
+  # 注：不用 flock —— mksh 的 exec N> 打开的 fd 带 CLOEXEC，
+  # busybox flock 的 FD 模式在子 shell 里必然 EBADF（已实测）。
   if [ -d "${HEALTH_LOCK_DIR}" ]; then
     lock_age=$(( $(date +%s) - $(stat -c %Y "${HEALTH_LOCK_DIR}" 2>/dev/null || echo 0) ))
     if [ "${lock_age}" -gt ${HEALTH_LOCK_STALE} ]; then
-      rmdir "${HEALTH_LOCK_DIR}" 2>/dev/null || true
+      rm -rf "${HEALTH_LOCK_DIR}" 2>/dev/null || true
       health_log "Warn" "看门狗: 清理陈旧锁（已残留 ${lock_age}s）"
     fi
   fi
-  # 拿不到锁说明已有实例在跑。必须留痕：静默 return 会让看门狗无声
-  # 失效，事后完全没有线索（这正是之前踩过的坑）。
-  mkdir "${HEALTH_LOCK_DIR}" 2>/dev/null || {
+  if ! mkdir "${HEALTH_LOCK_DIR}" 2>/dev/null; then
     health_log "Info" "看门狗: 已有实例在运行，跳过本次检查"
     return 0
-  }
-  trap 'rmdir "${HEALTH_LOCK_DIR}" 2>/dev/null' EXIT
+  fi
+  trap 'rm -rf "${HEALTH_LOCK_DIR}" 2>/dev/null' EXIT
 
   health_cooldown_ok || return 0
   date +%s > "${HEALTH_STATE_FILE}" 2>/dev/null || true
@@ -899,21 +906,27 @@ watch_tun_health() {
       health_log "Warn" "看门狗: 10 分钟内已有效重启 ${HEALTH_RESTART_LIMIT} 次，跳过本次重建"
       return 0
     fi
-    old_pid=$(health_current_pid)
-    if command -v setsid >/dev/null 2>&1; then
-      setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
-    else
-      "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
-    fi
-    if health_wait_restart_done "${old_pid}"; then
-      health_log "Info" "看门狗: TUN 已重建"
-      health_clear_defer
-      health_refresh_delays
-    else
+    attempt=0
+    while [ "${attempt}" -lt ${HEALTH_TUN_RETRY} ]; do
+      attempt=$((attempt + 1))
+      old_pid=$(health_current_pid)
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+      else
+        "${SCRIPTS_DIR}/box.service" restart >/dev/null 2>&1
+      fi
+      if health_wait_restart_done "${old_pid}"; then
+        health_log "Info" "看门狗: TUN 已重建（第 ${attempt} 次尝试）"
+        health_clear_defer
+        health_refresh_delays
+        return 0
+      fi
       health_log_tun_failure
-      health_record_restart
-      health_log "Warn" "看门狗: TUN 仍未建立，已计入有效失败"
-    fi
+      health_log "Warn" "看门狗: 第 ${attempt}/${HEALTH_TUN_RETRY} 次重建后 TUN 仍未建立"
+      [ "${attempt}" -lt ${HEALTH_TUN_RETRY} ] && busybox sleep ${HEALTH_TUN_RETRY_DELAY}
+    done
+    health_record_restart
+    health_log "Warn" "看门狗: TUN 重建连续 ${HEALTH_TUN_RETRY} 次失败，已计入有效失败"
     return 0
   fi
 
